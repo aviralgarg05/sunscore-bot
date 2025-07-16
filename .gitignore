@@ -9,6 +9,10 @@ dist/
 build/
 *.tgz
 
+#environment
+venv/
+env/
+__pycache__/
 # Environment variables
 .env
 .env.local
