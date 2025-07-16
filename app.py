@@ -37,6 +37,9 @@ class SunScoreCalculator:
         # Create unique location dataframe for spatial indexing
         self.locations_df = self.df[['latitude', 'longitude', 'zip_code']].drop_duplicates().reset_index(drop=True)
         
+        # Convert zip codes to numeric for proximity calculations
+        self.locations_df['zip_numeric'] = pd.to_numeric(self.locations_df['zip_code'], errors='coerce')
+        
         print(f"Sample zip codes in data: {sorted(self.locations_df['zip_code'].unique())[:10]}")
         
     def _create_spatial_index(self):
@@ -88,95 +91,152 @@ class SunScoreCalculator:
         
         return nearby_locations
     
+    def _calculate_zip_distance(self, zip1, zip2):
+        """Calculate proximity between two US zip codes using numeric distance"""
+        try:
+            zip1_num = int(str(zip1).zfill(5))
+            zip2_num = int(str(zip2).zfill(5))
+            
+            # For US zip codes, numeric proximity often correlates with geographic proximity
+            # Use a scaled approach where closer numbers = higher similarity
+            numeric_diff = abs(zip1_num - zip2_num)
+            
+            # Special handling for different zip code ranges
+            if numeric_diff == 0:
+                return 0  # Exact match
+            elif numeric_diff <= 5:
+                return 1  # Very close (likely same area)
+            elif numeric_diff <= 20:
+                return 2  # Close (likely same city/region)
+            elif numeric_diff <= 100:
+                return 3  # Moderate distance (same metro area)
+            elif numeric_diff <= 500:
+                return 4  # Same state/region
+            else:
+                return 5  # Far apart
+                
+        except (ValueError, TypeError):
+            return 10  # Invalid zip codes
+    
+    def _find_nearby_zip_codes(self, user_zip, max_zip_distance=3, limit=10):
+        """Find zip codes that are numerically close to the user's zip code"""
+        if not user_zip:
+            return []
+            
+        user_zip_normalized = str(user_zip).zfill(5)
+        
+        try:
+            user_zip_num = int(user_zip_normalized)
+        except ValueError:
+            return []
+        
+        # Calculate zip code distances for all locations
+        zip_distances = []
+        for _, location in self.locations_df.iterrows():
+            zip_dist = self._calculate_zip_distance(user_zip_num, location['zip_code'])
+            if zip_dist <= max_zip_distance:
+                zip_distances.append({
+                    'zip_code': location['zip_code'],
+                    'latitude': location['latitude'],
+                    'longitude': location['longitude'],
+                    'zip_distance': zip_dist,
+                    'zip_numeric': location['zip_numeric']
+                })
+        
+        # Sort by zip distance (closer zip codes first)
+        zip_distances.sort(key=lambda x: (x['zip_distance'], abs(user_zip_num - x['zip_numeric'])))
+        
+        return zip_distances[:limit]
+    
     def _get_nearby_locations_with_zip(self, user_lat, user_lon, user_zip=None, k=5, max_distance_km=50):
-        """Enhanced search using both zip code and spatial proximity"""
+        """Enhanced search using both zip code numeric proximity and spatial proximity"""
         nearby_locations = []
         
-        # Strategy 1: If zip code is provided, prioritize exact matches
+        # Strategy 1: If zip code is provided, find numerically close zip codes
         if user_zip:
-            # Normalize user zip code
             user_zip_normalized = str(user_zip).zfill(5)
-            print(f"Searching for zip code: {user_zip_normalized}")
+            print(f"Searching for zip codes close to: {user_zip_normalized}")
             
-            exact_zip_matches = self.locations_df[self.locations_df['zip_code'] == user_zip_normalized]
+            # Find nearby zip codes using numeric proximity
+            nearby_zips = self._find_nearby_zip_codes(user_zip_normalized, max_zip_distance=3, limit=k*2)
             
-            if not exact_zip_matches.empty:
-                print(f"Found {len(exact_zip_matches)} exact zip code matches: {user_zip_normalized}")
-                # Add all locations in the same zip code with highest weight
-                for _, location in exact_zip_matches.iterrows():
-                    distance = self._haversine_distance(
+            if nearby_zips:
+                print(f"Found {len(nearby_zips)} numerically close zip codes")
+                
+                for zip_info in nearby_zips:
+                    # Calculate actual geographic distance
+                    geo_distance = self._haversine_distance(
                         user_lat, user_lon, 
-                        location['latitude'], location['longitude']
+                        zip_info['latitude'], zip_info['longitude']
                     )
+                    
+                    if geo_distance <= max_distance_km:
+                        # Calculate weight based on both zip proximity and geographic distance
+                        zip_weight_factor = {0: 10, 1: 8, 2: 6, 3: 4}.get(zip_info['zip_distance'], 2)
+                        geo_weight_factor = 1 / (1 + geo_distance * 0.1)
+                        
+                        combined_weight = zip_weight_factor * geo_weight_factor
+                        
+                        match_type = 'exact_zip' if zip_info['zip_distance'] == 0 else 'close_zip'
+                        
+                        nearby_locations.append({
+                            'zip_code': zip_info['zip_code'],
+                            'latitude': zip_info['latitude'],
+                            'longitude': zip_info['longitude'],
+                            'distance': geo_distance,
+                            'weight': combined_weight,
+                            'match_type': match_type,
+                            'zip_distance': zip_info['zip_distance']
+                        })
+                        
+                        print(f"  Zip: {zip_info['zip_code']}, Geo Distance: {geo_distance:.2f}km, "
+                              f"Zip Distance: {zip_info['zip_distance']}, Weight: {combined_weight:.2f}")
+            else:
+                print(f"No numerically close zip codes found for: {user_zip_normalized}")
+        
+        # Strategy 2: Fill remaining slots with spatial search if needed
+        current_count = len(nearby_locations)
+        if current_count < k:
+            remaining_needed = k - current_count
+            
+            user_coords_rad = np.radians([[user_lat, user_lon]])
+            
+            # Search for more locations spatially
+            spatial_k = max(remaining_needed * 2, 10)
+            distances_rad, indices = self.kdtree.query(
+                user_coords_rad, 
+                k=min(spatial_k, len(self.locations_df))
+            )
+            
+            distances_km = distances_rad[0] * 6371
+            indices = indices[0]
+            
+            # Add spatial neighbors (excluding already added locations)
+            existing_zips = {loc['zip_code'] for loc in nearby_locations}
+            
+            for i, idx in enumerate(indices):
+                if len(nearby_locations) >= k:
+                    break
+                    
+                if distances_km[i] > max_distance_km:
+                    continue
+                    
+                location = self.locations_df.iloc[idx]
+                
+                if location['zip_code'] not in existing_zips:
                     nearby_locations.append({
                         'zip_code': location['zip_code'],
                         'latitude': location['latitude'],
                         'longitude': location['longitude'],
-                        'distance': distance,
-                        'weight': 10 / (1 + distance * 0.1),  # High weight for same zip
-                        'match_type': 'exact_zip'
+                        'distance': distances_km[i],
+                        'weight': 1 / (1 + distances_km[i] * 0.1),
+                        'match_type': 'spatial',
+                        'zip_distance': None
                     })
-            else:
-                print(f"No exact zip code match found for: {user_zip_normalized}")
-                
-                # Try partial matches (first 3 digits)
-                zip_prefix = user_zip_normalized[:3]
-                partial_matches = self.locations_df[self.locations_df['zip_code'].str.startswith(zip_prefix)]
-                
-                if not partial_matches.empty:
-                    print(f"Found {len(partial_matches)} partial zip code matches with prefix: {zip_prefix}")
-                    for _, location in partial_matches.iterrows():
-                        distance = self._haversine_distance(
-                            user_lat, user_lon, 
-                            location['latitude'], location['longitude']
-                        )
-                        if distance <= max_distance_km:
-                            nearby_locations.append({
-                                'zip_code': location['zip_code'],
-                                'latitude': location['latitude'],
-                                'longitude': location['longitude'],
-                                'distance': distance,
-                                'weight': 5 / (1 + distance * 0.2),  # Medium weight for similar zip
-                                'match_type': 'similar_zip'
-                            })
-        
-        # Strategy 2: Spatial search for additional nearby locations
-        user_coords_rad = np.radians([[user_lat, user_lon]])
-        
-        # Increase k for spatial search to get more options
-        spatial_k = max(k * 2, 10) if user_zip and nearby_locations else k
-        distances_rad, indices = self.kdtree.query(
-            user_coords_rad, 
-            k=min(spatial_k, len(self.locations_df))
-        )
-        
-        distances_km = distances_rad[0] * 6371
-        indices = indices[0]
-        
-        # Add spatial neighbors (excluding already added zip matches)
-        existing_locations = {(loc['latitude'], loc['longitude']) for loc in nearby_locations}
-        
-        for i, idx in enumerate(indices):
-            if distances_km[i] > max_distance_km:
-                continue
-                
-            location = self.locations_df.iloc[idx]
-            location_key = (location['latitude'], location['longitude'])
-            
-            if location_key not in existing_locations:
-                nearby_locations.append({
-                    'zip_code': location['zip_code'],
-                    'latitude': location['latitude'],
-                    'longitude': location['longitude'],
-                    'distance': distances_km[i],
-                    'weight': 1 / (1 + distances_km[i] * 0.1),
-                    'match_type': 'spatial'
-                })
         
         # Sort by weight (highest first) and limit to k locations
         nearby_locations.sort(key=lambda x: x['weight'], reverse=True)
         
-        # Ensure we don't exceed the requested number of locations
         return nearby_locations[:k]
     
     def _calculate_weighted_sunscore(self, nearby_locations):
@@ -290,28 +350,35 @@ class SunScoreCalculator:
         return min(100, confidence)
     
     def _calculate_enhanced_confidence_with_zip(self, monthly_data, nearby_locations, user_zip=None):
-        """Enhanced confidence calculation considering zip code matches"""
+        """Enhanced confidence calculation considering zip code numeric proximity"""
         if monthly_data is None or len(monthly_data) == 0:
             return 0
         
-        # Factor 1: Zip code match bonus
-        zip_confidence = 30  # Lower base confidence
+        # Factor 1: Zip code proximity bonus (much more accurate now)
+        zip_confidence = 30  # Base confidence
         if user_zip:
             user_zip_normalized = str(user_zip).zfill(5)
+            
+            # Count exact and close matches
             exact_matches = sum(1 for loc in nearby_locations 
-                              if loc['zip_code'] == user_zip_normalized)
-            similar_matches = sum(1 for loc in nearby_locations 
-                                if loc['zip_code'].startswith(user_zip_normalized[:3]))
+                              if loc.get('zip_distance') == 0)
+            very_close_matches = sum(1 for loc in nearby_locations 
+                                   if loc.get('zip_distance') == 1)
+            close_matches = sum(1 for loc in nearby_locations 
+                              if loc.get('zip_distance') in [2, 3])
             
             if exact_matches > 0:
-                zip_confidence = min(100, 90 + exact_matches * 5)  # Very high confidence for exact matches
-                print(f"Exact zip matches found: {exact_matches} - High confidence boost")
-            elif similar_matches > 0:
-                zip_confidence = min(100, 70 + similar_matches * 5)  # Good confidence for similar zips
-                print(f"Similar zip matches found: {similar_matches} - Medium confidence boost")
+                zip_confidence = min(100, 95 + exact_matches * 2)
+                print(f"Exact zip matches found: {exact_matches} - Very high confidence")
+            elif very_close_matches > 0:
+                zip_confidence = min(100, 85 + very_close_matches * 3)
+                print(f"Very close zip matches found: {very_close_matches} - High confidence")
+            elif close_matches > 0:
+                zip_confidence = min(100, 70 + close_matches * 2)
+                print(f"Close zip matches found: {close_matches} - Good confidence")
             else:
-                zip_confidence = 40  # No zip match found
-                print("No zip code matches found - using spatial data only")
+                zip_confidence = 40
+                print("No close zip codes found - using spatial data only")
         
         # Factor 2: Average distance to data points
         avg_distance = np.mean([loc['distance'] for loc in nearby_locations])
@@ -447,10 +514,10 @@ if hasattr(sunscore_data, '__len__') and len(sunscore_data) > 0:
     print(f"Peak Month: {peak_month['Month']}/{peak_month['Year']} (Score: {peak_month['Sunscore']:.1f})")
     print(f"Lowest Month: {low_month['Month']}/{low_month['Year']} (Score: {low_month['Sunscore']:.1f})")
 
-# Example usage with zip code
+# Example usage with zip code (now with proper numeric proximity)
 user_lat = 42.04783608530275
 user_lon = -72.62718033091582
-user_zip = "01013"  # Example zip code
+user_zip = "01013"  # This should now find closer zip codes like 01012, 01014, etc.
 
 # Get enhanced sunscore with zip code information
 sunscore_data, confidence_level = calculator.get_monthly_sunscore(
@@ -461,7 +528,7 @@ sunscore_data, confidence_level = calculator.get_monthly_sunscore(
 )
 
 # Display results
-print("\nEnhanced Monthly Sunscore Data (Scaled to 100) with Zip Code:")
+print("\nEnhanced Monthly Sunscore Data (Scaled to 100) with Improved Zip Code Matching:")
 print(sunscore_data)
 print(f"\nEnhanced Confidence Level: {confidence_level:.2f}%")
 
@@ -471,7 +538,7 @@ if hasattr(sunscore_data, '__len__') and len(sunscore_data) > 0:
     peak_month = sunscore_data.loc[sunscore_data['Sunscore'].idxmax()]
     low_month = sunscore_data.loc[sunscore_data['Sunscore'].idxmin()]
     
-    print(f"\nAdditional Insights with Zip Code:")
+    print(f"\nAdditional Insights with Improved Zip Code Matching:")
     print(f"Annual Average Sunscore: {annual_avg:.1f}")
     print(f"Peak Month: {peak_month['Month']}/{peak_month['Year']} (Score: {peak_month['Sunscore']:.1f})")
     print(f"Lowest Month: {low_month['Month']}/{low_month['Year']} (Score: {low_month['Sunscore']:.1f})")
