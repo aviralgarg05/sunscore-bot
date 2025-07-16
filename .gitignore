@@ -8,6 +8,8 @@ yarn-error.log*
 dist/
 build/
 *.tgz
+*.csv
+solar_data.csv
 
 #environment
 venv/
