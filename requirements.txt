@@ -1,2 +1,12 @@
 pandas
-pymongo
+geopy
+scikit-learn
+scipy
+numba
+streamlit
+plotly
+folium
+streamlit-folium
+requests
+geocoder
+pydeck
